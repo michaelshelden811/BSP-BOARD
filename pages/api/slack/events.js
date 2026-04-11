@@ -5,10 +5,12 @@ import OpenAI from 'openai'
 
 export const config = { api: { bodyParser: false } }
 
+const AGENCY_ID = '2fa5f554-7a8e-4a18-8167-aaff152890f3'
+
 function getSupabase() {
   return createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    process.env.SUPABASE_SERVICE_ROLE_KEY
   )
 }
 
@@ -192,9 +194,10 @@ export default async function handler(req, res) {
   const supabase = getSupabase()
   const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://bsp-board-neon.vercel.app'
 
-  const rows = appointments.map(a => {
+  const rows = appointments.map((a, i) => {
     const weekOf = a.date ? getMondayOf(a.date) : getMondayOf(today)
     return {
+      agency_id: AGENCY_ID,
       appointment_type: a.appointment_type || 'Visit',
       day: a.day,
       date: a.date,
@@ -204,14 +207,14 @@ export default async function handler(req, res) {
       clients: a.client_name ? [a.client_name] : [],
       week_of: weekOf,
       status: 'open',
-      slack_message_id: event.ts || null,
+      slack_message_id: event.ts ? `${event.ts}_${i}` : null,
       type: 'peer_support',
     }
   })
 
   const { data: inserted, error } = await supabase.from('appointments').insert(rows).select()
   if (error) {
-    console.error('[BSP] Supabase insert error:', error.message)
+    console.error('[BSP] Supabase insert error:', error)
     await postToSlack(event.channel, '⚠️ BSP Board: Schedule parsed but failed to save. Error: ' + error.message)
     return res.status(200).json({ ok: true })
   }
@@ -224,7 +227,4 @@ export default async function handler(req, res) {
   const boardUrl = `${appUrl}/appointments?week=${weekOf || ''}`
 
   console.log('[BSP] Inserted', count, 'rows. Posting reply to channel', event.channel)
-  await postToSlack(event.channel, `✅ *BSP Board:* ${count} slot${count !== 1 ? 's' : ''} posted for the week of ${weekLabel}!\n👉 *Claim your slots here:* ${boardUrl}`)
-
-  return res.status(200).json({ ok: true, inserted: count })
-}
+  await postToSlack(event.channel, `✅ *BSP Board:* ${count} slot${count !== 1 ? 's' : ''} posted for the week of ${weekLabel}!\n👉 *C
