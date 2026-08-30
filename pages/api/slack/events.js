@@ -1,17 +1,40 @@
 // pages/api/slack/events.js
+// Slack Events API endpoint for BSP Board.
+//
+// Slack requires a response within 3 seconds. All slow work (OpenAI parsing,
+// Supabase writes, posting back to Slack) runs in the background via
+// waitUntil() AFTER the 200 has already been sent.
+
 import crypto from 'crypto'
 import { createClient } from '@supabase/supabase-js'
+import { waitUntil } from '@vercel/functions'
 import OpenAI from 'openai'
 
-export const config = { api: { bodyParser: false } }
+export const config = {
+  api: { bodyParser: false },
+  maxDuration: 60,
+}
 
-const AGENCY_ID = '2fa5f554-7a8e-4a18-8167-aaff152890f3'
+const APP_URL = process.env.NEXT_PUBLIC_APP_URL || 'https://bsp-board-neon.vercel.app'
+const AGENCY_NAME = 'Barbell Saves Project'
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function getSupabase() {
   return createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY
   )
+}
+
+async function getAgencyId(supabase) {
+  const { data, error } = await supabase
+    .from('agencies')
+    .select('id')
+    .eq('name', AGENCY_NAME)
+    .single()
+  if (error || !data) throw new Error('Agency not found: ' + (error?.message || 'no row'))
+  return data.id
 }
 
 async function getRawBody(req) {
@@ -42,25 +65,31 @@ function getMondayOf(dateStr) {
   return d.toISOString().split('T')[0]
 }
 
-async function postToSlack(channelId, text) {
+async function postToSlack(channelId, text, threadTs) {
   const token = process.env.SLACK_BOT_TOKEN
-  console.log('[BSP] postToSlack — token present:', !!token, '— channel:', channelId)
   if (!token) {
-    console.error('[BSP] SLACK_BOT_TOKEN is missing — cannot post reply')
+    console.error('[BSP] SLACK_BOT_TOKEN missing — cannot post reply')
     return
   }
-  const resp = await fetch('https://slack.com/api/chat.postMessage', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ channel: channelId, text }),
-  })
-  const json = await resp.json()
-  console.log('[BSP] Slack postMessage result:', JSON.stringify(json))
+  const payload = { channel: channelId, text, mrkdwn: true }
+  if (threadTs) payload.thread_ts = threadTs
+
+  try {
+    const resp = await fetch('https://slack.com/api/chat.postMessage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    })
+    const json = await resp.json()
+    if (!json.ok) console.error('[BSP] chat.postMessage failed:', json.error)
+  } catch (err) {
+    console.error('[BSP] chat.postMessage threw:', err.message)
+  }
 }
 
 async function parseScheduleWithAI(messageText, today) {
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-  const prompt = `You are parsing a peer support scheduling message from a supervisor at a recovery housing agency.
+  const prompt = `You are parsing a peer support appointment message from a house manager at a recovery housing agency.
 
 Today's date is ${today}. Extract all appointments from the message below.
 
@@ -68,16 +97,15 @@ Return a JSON array of appointment objects. Each object must have:
 - "day": day of week (Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday)
 - "date": date in YYYY-MM-DD format
 - "time": time in HH:MM 24-hour format (e.g. "09:00", "14:30")
-- "client_name": client's name (string, or null if not specified)
-- "address": address or location (string, or null)
-- "appointment_type": type of visit (e.g. "Home Visit", "Check-in", "Transport", "Office Visit", "Court", "Medical")
-- "purpose": brief description of purpose (string, or null)
+- "client_name": client first name or full name (string, or null)
+- "address": address or location name (string, or null)
+- "appointment_type": type of appointment (e.g. "Medical", "Probation", "Court", "DES", "Employment", "Home Visit")
+- "purpose": brief description (string, or null)
 
 Rules:
 - If the year is not given, assume the nearest upcoming date for that day of week.
-- If only a week is referenced (e.g. "next week" or "week of April 14"), use dates accordingly.
 - Return ONLY the raw JSON array — no markdown, no explanation, no code fences.
-- If no appointments can be parsed, return an empty array [].
+- If no appointments can be parsed, return [].
 
 Message:
 ${messageText}`
@@ -87,8 +115,8 @@ ${messageText}`
     messages: [{ role: 'user', content: prompt }],
     temperature: 0,
   })
+
   const raw = response.choices[0].message.content.trim()
-  console.log('[BSP] OpenAI raw response:', raw.slice(0, 200))
   try {
     return JSON.parse(raw)
   } catch {
@@ -96,6 +124,89 @@ ${messageText}`
     return JSON.parse(stripped)
   }
 }
+
+// ── Background work (runs after the 200 is sent) ──────────────────────────────
+
+async function processScheduleMessage(event) {
+  const channel = event.channel
+  const threadTs = event.ts
+  const text = event.text.trim()
+  const today = new Date().toISOString().split('T')[0]
+
+  let appointments
+  try {
+    appointments = await parseScheduleWithAI(text, today)
+    console.log('[BSP] Parsed', appointments.length, 'appointments')
+  } catch (err) {
+    console.error('[BSP] OpenAI parse error:', err.message)
+    await postToSlack(channel, "⚠️ *BSP Board:* I couldn't parse that appointment. Please check the format.", threadTs)
+    return
+  }
+
+  if (!Array.isArray(appointments) || appointments.length === 0) {
+    console.log('[BSP] No appointments found in message')
+    await postToSlack(channel, '⚠️ *BSP Board:* No appointments found. Include a day, a time, and a client.', threadTs)
+    return
+  }
+
+  const supabase = getSupabase()
+
+  let agencyId
+  try {
+    agencyId = await getAgencyId(supabase)
+  } catch (err) {
+    console.error('[BSP] Could not resolve agency_id:', err.message)
+    await postToSlack(channel, '⚠️ *BSP Board:* Agency not found in database. Contact your admin.', threadTs)
+    return
+  }
+
+  const rows = appointments.map((a, i) => {
+    const weekOf = a.date ? getMondayOf(a.date) : getMondayOf(today)
+    return {
+      agency_id: agencyId,
+      appointment_type: a.appointment_type || 'Appointment',
+      clients: a.client_name ? [a.client_name] : [],
+      day: a.day,
+      date: a.date,
+      time: a.time,
+      address: a.address || null,
+      purpose: a.purpose || null,
+      type: 'individual',
+      week_of: weekOf,
+      status: 'open',
+      slack_message_id: event.ts ? `${event.ts}_${i}` : null,
+    }
+  })
+
+  const { data: inserted, error } = await supabase.from('appointments').insert(rows).select()
+
+  if (error) {
+    // 23505 = unique violation: this Slack message was already ingested.
+    if (error.code === '23505') {
+      console.log('[BSP] Duplicate message — already ingested, skipping')
+      return
+    }
+    console.error('[BSP] Supabase insert error:', error)
+    await postToSlack(channel, '⚠️ *BSP Board:* Parsed but failed to save. Error: ' + error.message, threadTs)
+    return
+  }
+
+  const count = inserted.length
+  const weekOf = rows[0]?.week_of
+  const weekLabel = weekOf
+    ? new Date(weekOf + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+    : 'this week'
+  const boardUrl = weekOf ? `${APP_URL}/appointments?week=${weekOf}` : `${APP_URL}/appointments`
+
+  console.log('[BSP] Inserted', count, 'rows for week', weekOf)
+  await postToSlack(
+    channel,
+    `✅ *BSP Board:* ${count} slot${count !== 1 ? 's' : ''} posted for the week of ${weekLabel}!\n👉 *Claim yours:* ${boardUrl}`,
+    threadTs
+  )
+}
+
+// ── Handler ───────────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end()
@@ -108,12 +219,12 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Invalid JSON' })
   }
 
-  // Slack URL verification challenge
+  // Slack Request URL verification handshake
   if (body.type === 'url_verification') {
     return res.status(200).json({ challenge: body.challenge })
   }
 
-  // Verify signature
+  // Verify the request really came from Slack
   const signingSecret = process.env.SLACK_SIGNING_SECRET
   const timestamp = req.headers['x-slack-request-timestamp']
   const signature = req.headers['x-slack-signature']
@@ -122,13 +233,12 @@ export default async function handler(req, res) {
     console.error('[BSP] Missing signature headers')
     return res.status(401).json({ error: 'Missing Slack signature headers' })
   }
-
   if (!verifySlackSignature(rawBody, timestamp, signature, signingSecret)) {
     console.error('[BSP] Signature verification failed')
     return res.status(401).json({ error: 'Invalid signature' })
   }
 
-  // Ignore Slack retries
+  // Slack retries a delivery it thinks failed — never double-process.
   if (req.headers['x-slack-retry-num']) {
     console.log('[BSP] Ignoring Slack retry')
     return res.status(200).json({ ok: true })
@@ -137,94 +247,31 @@ export default async function handler(req, res) {
   const event = body.event
   if (!event) return res.status(200).json({ ok: true })
 
-  console.log('[BSP] Event type:', event.type, '| subtype:', event.subtype, '| bot_id:', event.bot_id, '| channel:', event.channel)
-
-  // Only handle real user messages
-  if (event.type !== 'message' || event.subtype === 'bot_message' || event.bot_id || !event.text) {
-    console.log('[BSP] Skipping — not a user message')
+  // Only real human messages
+  if (event.type !== 'message' || event.subtype || event.bot_id || !event.text) {
     return res.status(200).json({ ok: true })
   }
 
-  // Channel filter
+  // Only the appointments channel
   const allowedChannel = process.env.SLACK_CHANNEL_ID
-  console.log('[BSP] allowedChannel:', allowedChannel, '| event.channel:', event.channel, '| match:', event.channel === allowedChannel)
   if (allowedChannel && event.channel !== allowedChannel) {
-    console.log('[BSP] Skipping — wrong channel')
     return res.status(200).json({ ok: true })
   }
 
-  const text = event.text.trim()
-  console.log('[BSP] Message text preview:', text.slice(0, 100))
-
-  // Keyword check
-  const lower = text.toLowerCase()
-  const isSchedule =
-    lower.includes('schedule') ||
-    lower.includes('appt') ||
-    lower.includes('appointment') ||
-    lower.includes('visit') ||
-    lower.includes('week of') ||
-    lower.includes('next week')
-
-  console.log('[BSP] isSchedule:', isSchedule)
-  if (!isSchedule) {
-    console.log('[BSP] Skipping — no schedule keywords')
+  // Only messages that are actually about appointments
+  const lower = event.text.toLowerCase()
+  if (!lower.includes('appointment') && !lower.includes('appt')) {
     return res.status(200).json({ ok: true })
   }
 
-  // Parse with OpenAI
-  const today = new Date().toISOString().split('T')[0]
-  let appointments
-  try {
-    appointments = await parseScheduleWithAI(text, today)
-    console.log('[BSP] Parsed', appointments.length, 'appointments')
-  } catch (err) {
-    console.error('[BSP] OpenAI parse error:', err.message)
-    await postToSlack(event.channel, "⚠️ BSP Board: I couldn't parse that schedule. Please check the format and try again.")
-    return res.status(200).json({ ok: true })
-  }
+  console.log('[BSP] Accepted message ts:', event.ts, '| preview:', event.text.slice(0, 80))
 
-  if (!Array.isArray(appointments) || appointments.length === 0) {
-    console.log('[BSP] No appointments found in message')
-    await postToSlack(event.channel, '⚠️ BSP Board: No appointments found in that message. Make sure to include days, times, and at least one appointment.')
-    return res.status(200).json({ ok: true })
-  }
+  // Hand the slow work to the background, then answer Slack immediately.
+  waitUntil(
+    processScheduleMessage(event).catch(err => {
+      console.error('[BSP] Background processing failed:', err)
+    })
+  )
 
-  // Save to Supabase
-  const supabase = getSupabase()
-  const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://bsp-board-neon.vercel.app'
-
-  const rows = appointments.map((a, i) => {
-    const weekOf = a.date ? getMondayOf(a.date) : getMondayOf(today)
-    return {
-      agency_id: AGENCY_ID,
-      appointment_type: a.appointment_type || 'Visit',
-      day: a.day,
-      date: a.date,
-      time: a.time,
-      address: a.address || null,
-      purpose: a.purpose || null,
-      clients: a.client_name ? [a.client_name] : [],
-      week_of: weekOf,
-      status: 'open',
-      slack_message_id: event.ts ? `${event.ts}_${i}` : null,
-      type: 'peer_support',
-    }
-  })
-
-  const { data: inserted, error } = await supabase.from('appointments').insert(rows).select()
-  if (error) {
-    console.error('[BSP] Supabase insert error:', error)
-    await postToSlack(event.channel, '⚠️ BSP Board: Schedule parsed but failed to save. Error: ' + error.message)
-    return res.status(200).json({ ok: true })
-  }
-
-  const count = inserted.length
-  const weekOf = rows[0]?.week_of
-  const weekLabel = weekOf
-    ? new Date(weekOf + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
-    : 'this week'
-  const boardUrl = `${appUrl}/appointments?week=${weekOf || ''}`
-
-  console.log('[BSP] Inserted', count, 'rows. Posting reply to channel', event.channel)
-  await postToSlack(event.channel, `✅ *BSP Board:* ${count} slot${count !== 1 ? 's' : ''} posted for the week of ${weekLabel}!\n👉 *C
+  return res.status(200).json({ ok: true })
+}
